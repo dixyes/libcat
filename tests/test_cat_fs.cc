@@ -1091,6 +1091,8 @@ inline int maxpath_260_clean(const char *dir){
 }
 
 TEST(cat_fs, maxpath_260){
+    SKIP_IF_(no_tmp(), "Temp dir not writable");
+
     // prepare target names
     std::string dirstr = path_join(TEST_TMP_PATH, "cat_tests_maxpath_260");
     const size_t dirlen = dirstr.length();
@@ -1226,3 +1228,62 @@ TEST(cat_fs, maxpath_260){
     report_error = 0;
 }
 #endif
+
+// thread numbers used in test,
+// needs more then thread pool capability
+#define FLOCK_TEST_THREADS 24
+TEST(cat_fs, flock_deadlock){
+    SKIP_IF_(no_tmp(), "Temp dir not writable");
+    
+    std::string fnstr = path_join(TEST_TMP_PATH, "cat_tests_flock");
+    const char * fn = fnstr.c_str();
+
+    cat_fs_unlink(fn);
+    DEFER(cat_fs_unlink(fn));
+    int fd = cat_fs_open(fn, CAT_FS_O_CREAT | CAT_FS_O_RDWR, 0666);
+
+    static int count = 0;
+    static bool done = false;
+
+    for(int i=0; i < FLOCK_TEST_THREADS; i++){
+        co([fd] {
+            cat_fs_flock(fd, CAT_LOCK_EX);
+            count++;
+        });
+    }
+    DEFER({
+        // wait for all coro done
+        while(count < FLOCK_TEST_THREADS){
+            cat_fs_flock(fd, CAT_LOCK_UN);
+        }
+        cat_fs_close(fd);
+    });
+
+    co([fn] {
+        // this access should not blocking long
+        cat_fs_access(fn, F_OK);
+        done = true;
+    });
+
+    int waittime;
+    // sleep max 1.024s for access done
+    for(waittime = 1; (!done) && (waittime < 1024); waittime*=2){
+        cat_time_wait(waittime);
+    }
+    ASSERT_TRUE(done);
+
+    done = false;
+    int ret = 0;
+    co([&ret, fd] {
+        ret = cat_fs_flock(fd, CAT_LOCK_EX | CAT_LOCK_NB);
+        done = true;
+    });
+
+    // sleep max 1.024s for acquire flock done
+    for(waittime = 1; (!done) && (waittime < 1024); waittime*=2){
+        cat_time_wait(waittime);
+    }
+    ASSERT_TRUE(done);
+    ASSERT_LT(ret, 0);
+    ASSERT_EQ(cat_fs_flock(fd, CAT_LOCK_UN), 0);
+}
