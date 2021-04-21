@@ -1155,23 +1155,27 @@ static void cat_fs_orig_flock(struct cat_fs_flock_s*data){
     }
 
     OVERLAPPED overlapped = { 0 };
+    // mock unix-like behavier: if we already have a lock,
+    // flock only update the lock to specified type (shared or exclusive)
+    // so we unlock first
+    if (!UnlockFileEx(
+        hFile,
+        0,
+        MAXDWORD,
+        MAXDWORD,
+        &overlapped
+    )){
+        data->ret.error.type = CAT_FS_ERROR_WIN32;
+        data->ret.error.val.le = GetLastError();
+        data->ret.ret.num = -1;
+        *running = 0;
+        return;
+    }
     if (CAT_LOCK_UN == op_type){
-        if (!UnlockFileEx(
-            hFile,
-            0,
-            MAXDWORD,
-            MAXDWORD,
-            &overlapped
-        )){
-            data->ret.error.type = CAT_FS_ERROR_WIN32;
-            data->ret.error.val.le = GetLastError();
-            data->ret.ret.num = -1;
-            *running = 0;
-            return;
-        }
         data->ret.ret.num = 0;
         *running = 0;
         return;
+        // already unlocked
     } else if (CAT_LOCK_EX == op_type || CAT_LOCK_SH == op_type){
         DWORD flags = 0;
         if(CAT_LOCK_EX == op_type){
@@ -1188,6 +1192,17 @@ static void cat_fs_orig_flock(struct cat_fs_flock_s*data){
             MAXDWORD,
             &overlapped
         )){
+            // if LOCK_NB is set, but we donot get lock
+            // then unlock it after it's done
+            if ((CAT_LOCK_NB & cat_op) == CAT_LOCK_NB){
+                data->ret.error.type = CAT_FS_ERROR_CAT_ERRNO;
+                data->ret.error.val.le = CAT_EAGAIN;
+                data->ret.ret.num = -1;
+                *running = 0;
+                DWORD dummy;
+                GetOverlappedResult(hFile, &overlapped, &dummy, 1);
+                printf("nb end\n");
+            }
             data->ret.error.type = CAT_FS_ERROR_WIN32;
             data->ret.error.val.le = GetLastError();
             data->ret.ret.num = -1;
