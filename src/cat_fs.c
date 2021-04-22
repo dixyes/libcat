@@ -1143,7 +1143,6 @@ static void cat_fs_orig_flock(struct cat_fs_flock_s*data){
     int operation = 0;
     int op_type = cat_op & (CAT_LOCK_SH | CAT_LOCK_EX | CAT_LOCK_UN);
 #ifdef CAT_OS_WIN
-#  define FLOCK_HAVE_NB
     // Windows implement
     HANDLE hFile = (HANDLE)_get_osfhandle(fd);
     if(INVALID_HANDLE_VALUE == hFile){
@@ -1157,14 +1156,19 @@ static void cat_fs_orig_flock(struct cat_fs_flock_s*data){
     OVERLAPPED overlapped = { 0 };
     // mock unix-like behavier: if we already have a lock,
     // flock only update the lock to specified type (shared or exclusive)
-    // so we unlock first
-    if (!UnlockFileEx(
-        hFile,
-        0,
-        MAXDWORD,
-        MAXDWORD,
-        &overlapped
-    )){
+    // so we unlock first, then re-lock it
+    if (
+        (!UnlockFileEx(
+            hFile,
+            0,
+            MAXDWORD,
+            MAXDWORD,
+            &overlapped
+        )) &&
+        GetLastError() != ERROR_NOT_LOCKED // not an error
+    ){
+        //printf("u failed\n");
+        //printf("le %08x\n", errno, GetLastError());
         data->ret.error.type = CAT_FS_ERROR_WIN32;
         data->ret.error.val.le = GetLastError();
         data->ret.ret.num = -1;
@@ -1172,11 +1176,14 @@ static void cat_fs_orig_flock(struct cat_fs_flock_s*data){
         return;
     }
     if (CAT_LOCK_UN == op_type){
+        // already unlocked
+        //printf("u end\n");
         data->ret.ret.num = 0;
         *running = 0;
         return;
-        // already unlocked
-    } else if (CAT_LOCK_EX == op_type || CAT_LOCK_SH == op_type){
+    }
+
+    if (CAT_LOCK_EX == op_type || CAT_LOCK_SH == op_type){
         DWORD flags = 0;
         if(CAT_LOCK_EX == op_type){
             flags |= LOCKFILE_EXCLUSIVE_LOCK;
@@ -1193,26 +1200,38 @@ static void cat_fs_orig_flock(struct cat_fs_flock_s*data){
             &overlapped
         )){
             // if LOCK_NB is set, but we donot get lock
-            // then unlock it after it's done
+            // we should unlock it after it was done (cancelling lock behavior) 
             if ((CAT_LOCK_NB & cat_op) == CAT_LOCK_NB){
+                //printf("nb wait\n");
                 data->ret.error.type = CAT_FS_ERROR_CAT_ERRNO;
                 data->ret.error.val.le = CAT_EAGAIN;
                 data->ret.ret.num = -1;
                 *running = 0;
                 DWORD dummy;
-                GetOverlappedResult(hFile, &overlapped, &dummy, 1);
-                printf("nb end\n");
+                BOOL done = GetOverlappedResult(hFile, &overlapped, &dummy, 1);
+                //printf("nb wait done\n");
+                UnlockFileEx(
+                    hFile,
+                    0,
+                    MAXDWORD,
+                    MAXDWORD,
+                    &overlapped
+                );
+                return;
             }
+            //printf("b done\n");
             data->ret.error.type = CAT_FS_ERROR_WIN32;
             data->ret.error.val.le = GetLastError();
             data->ret.ret.num = -1;
             *running = 0;
             return;
         }
+        //printf("nb done\n");
         data->ret.ret.num = 0;
         *running = 0;
         return;
     } else {
+        //printf("not supported\n");
         data->ret.error.type = CAT_FS_ERROR_WIN32;
         data->ret.error.val.le = ERROR_INVALID_PARAMETER;
         data->ret.ret.num = -1;
@@ -1294,6 +1313,7 @@ CAT_FS_WORK_CB(flock){
     };
     int ret = uv_thread_create_ex(&tid, &params, cat_fs_orig_flock, data);
     if(0 != ret){
+        //printf("thread failed\n");
         data->ret.ret.num = -1;
         data->ret.error.type = CAT_FS_ERROR_CAT_ERRNO;
         data->ret.error.val.cat_errno = ret;
